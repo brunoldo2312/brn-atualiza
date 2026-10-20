@@ -1,0 +1,147 @@
+/*
+ * brn_miner.c â€” PoW miner em C para BRN
+ * ================================================================
+ * Compilar:
+ *   gcc -O3 -march=native -shared -fPIC -o brn_miner.so brn_miner.c -lcrypto
+ *
+ * Requer:
+ *   sudo apt install build-essential libssl-dev
+ *
+ * Reproduz EXATAMENTE o formato do Python:
+ *   prefix   = f"{prev_hash}{merkle}{ts}"
+ *   diff_str = str(diff)
+ *   data     = prefix + str(nonce) + diff_str
+ *   hash     = SHA256(SHA256(data))
+ *   target   = int("0"*diff + "f"*(64-diff), 16)
+ *   if int(hash) <= target: encontrou
+ * ================================================================
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <openssl/sha.h>
+#include <time.h>
+
+int brn_pow_search(
+    const char* prefix, size_t prefix_len,
+    const char* diff_str, size_t diff_str_len,
+    uint64_t nonce_start,
+    uint64_t max_iters,
+    int difficulty,
+    char* out_hash_hex,
+    uint64_t* out_nonce,
+    uint64_t* out_hashes
+) {
+    if (!prefix || !diff_str || !out_hash_hex || !out_nonce || !out_hashes)
+        return -1;
+    if (difficulty < 1 || difficulty > 62)
+        return -1;
+
+    /* ---------- Target: 'difficulty' nibbles zero + f's ---------- */
+    unsigned char target[32];
+    memset(target, 0xff, 32);
+
+    int full_bytes   = difficulty / 2;
+    int extra_nibble = difficulty % 2;
+
+    for (int i = 0; i < full_bytes; i++)
+        target[i] = 0x00;
+    if (extra_nibble)
+        target[full_bytes] = 0x0f;
+
+    /* ---------- Buffer para concatenar ---------- */
+    size_t buf_size = prefix_len + 24 + diff_str_len + 8;
+    char* data = (char*)malloc(buf_size);
+    if (!data) return -1;
+
+    memcpy(data, prefix, prefix_len);
+
+    unsigned char hash1[SHA256_DIGEST_LENGTH];
+    unsigned char hash2[SHA256_DIGEST_LENGTH];
+
+    uint64_t nonce  = nonce_start;
+    uint64_t hashes = 0;
+
+    while (max_iters == 0 || hashes < max_iters) {
+        /* nonce â†’ string decimal */
+        int n_digits = snprintf(data + prefix_len, 24, "%llu",
+                                (unsigned long long)nonce);
+        if (n_digits <= 0) break;
+
+        /* + diff_str */
+        memcpy(data + prefix_len + n_digits, diff_str, diff_str_len);
+        size_t total = prefix_len + n_digits + diff_str_len;
+
+        /* Double SHA256 */
+        SHA256((const unsigned char*)data, total, hash1);
+        SHA256(hash1, SHA256_DIGEST_LENGTH, hash2);
+
+        hashes++;
+
+        /* hash2 <= target? (big-endian) */
+        if (memcmp(hash2, target, 32) <= 0) {
+            static const char* hx = "0123456789abcdef";
+            for (int i = 0; i < 32; i++) {
+                out_hash_hex[i*2]   = hx[(hash2[i] >> 4) & 0xf];
+                out_hash_hex[i*2+1] = hx[ hash2[i]       & 0xf];
+            }
+            out_hash_hex[64] = '\0';
+            *out_nonce  = nonce;
+            *out_hashes = hashes;
+            free(data);
+            return 0;   /* achou */
+        }
+
+        nonce++;
+    }
+
+    *out_nonce  = nonce;
+    *out_hashes = hashes;
+    free(data);
+    return 1;   /* esgotou iteraÃ§Ãµes, nÃ£o achou */
+}
+
+/* ---------- VersÃ£o com benchmark (opcional) ---------- */
+double brn_benchmark(
+    const char* prefix, size_t prefix_len,
+    const char* diff_str, size_t diff_str_len,
+    int difficulty,
+    uint64_t iters
+) {
+    if (difficulty < 1 || difficulty > 62) return 0.0;
+
+    unsigned char target[32];
+    memset(target, 0xff, 32);
+    int full_bytes   = difficulty / 2;
+    int extra_nibble = difficulty % 2;
+    for (int i = 0; i < full_bytes; i++) target[i] = 0x00;
+    if (extra_nibble) target[full_bytes] = 0x0f;
+
+    size_t buf_size = prefix_len + 24 + diff_str_len + 8;
+    char* data = (char*)malloc(buf_size);
+    if (!data) return 0.0;
+    memcpy(data, prefix, prefix_len);
+
+    unsigned char hash1[SHA256_DIGEST_LENGTH];
+    unsigned char hash2[SHA256_DIGEST_LENGTH];
+
+    uint64_t start_ns = (uint64_t)(
+        (double)clock() / CLOCKS_PER_SEC * 1e9);
+
+    for (uint64_t i = 0; i < iters; i++) {
+        int n_digits = snprintf(data + prefix_len, 24, "%llu",
+                                (unsigned long long)i);
+        memcpy(data + prefix_len + n_digits, diff_str, diff_str_len);
+        size_t total = prefix_len + n_digits + diff_str_len;
+        SHA256((const unsigned char*)data, total, hash1);
+        SHA256(hash1, SHA256_DIGEST_LENGTH, hash2);
+    }
+
+    uint64_t end_ns = (uint64_t)(
+        (double)clock() / CLOCKS_PER_SEC * 1e9);
+    free(data);
+
+    double dt = (end_ns - start_ns) / 1e9;
+    return (double)iters / (dt > 0 ? dt : 1);
+}
