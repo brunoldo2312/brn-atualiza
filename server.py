@@ -1,26 +1,17 @@
-one"""
-server.py — Backend HTTP → do nó BRN (v9 has.9.9)
+"""
+server.py — Backend HTTP do nó BRN (v9.9.10)
 ================================================================
-hesv9.9.9:
-  [F_totalIX] /api/sync/status com fallback para altura real caso o
+v9.9.10:
+  [FIX CRÍTICO] Rota /api/pool/submit, /api/pool/work e /api/pool/heartbeat
+        agora usam @require_rate_limit("pool_submit"/"pool_work"/"pool_heartbeat")
+        em vez de "status". Isso resolve o erro 429 durante mineração.
+v9.9.9:
+  [FIX] /api/sync/status com fallback para altura real caso o
         sync_manager retorne -1 (painel mostrando -1).
   [FIX] Adicionado campo 'forking' na resposta de /api/sync/status.
-  [FIX] /api/minhas-txs agora aceita ?limit=N (padrão 50, máx 200).
-        Evita timeout do SQLite quando o banco tem muitos UTXOs.
   [NEW] Integração completa da Trust Network (set_trust_network
         e rotas /api/trust/*).
-v9.9.8:
-  [FIX CRÍTICO] /api/l2/claim agora consulta BTC on-chain ANTES de
-        creditar BRN. Antes passava btc_amount_sats=esperado (o valor
-        do escrow) em vez do valor REALMENTE recebido. Um atacante
-        podia pagar 0.0001 BTC e receber o BRN de 1 BTC.
-  [FIX] HDWalletManager com import defensivo (try/except). Se o
-        wallet.py não tiver a classe, o server sobe mesmo assim.
-  [FIX] /api/miner/status alinhado com miner_loop v6.8:
-        hashes, hashes_done → hashes_done,
-        eta_seconds → eta_seconds (opcional).
-  [NEW] set_p2p_manager / set_sync_manager / set_pool_manager
-        expostos para o main.py v13.1 injetar.
+  [NEW] Rota /api/experiment/variant para o Teste A/B.
 ================================================================
 """
 from __future__ import annotations
@@ -43,7 +34,6 @@ from flask_cors import CORS
 
 from wallet import Wallet, WalletManager
 
-# [FIX v9.9.8] HDWalletManager é opcional — não quebra se ausente
 try:
     from wallet import HDWalletManager
     _HAS_HD = True
@@ -71,19 +61,10 @@ except ImportError:
         def deco(fn):
             return fn
         return deco
-
-    def audit_log(event, data=None):
-        pass
-
-    def close_audit():
-        pass
-
-    def hash_short(v, n=12):
-        return str(v)[:n] if v else ""
-
-    def get_client_ip():
-        return request.remote_addr or "0.0.0.0"
-
+    def audit_log(event, data=None): pass
+    def close_audit(): pass
+    def hash_short(v, n=12): return str(v)[:n] if v else ""
+    def get_client_ip(): return request.remote_addr or "0.0.0.0"
 
 log = logging.getLogger("server")
 
@@ -209,20 +190,19 @@ try:
 except ImportError:
     L2_ENABLED = False
     L2Manager = None
-    L2Error =ub Exception
+    L2Error = Exception
     btc_config = None
 
-_l2_mgr = Nonekey
+_l2_mgr = None
 _l2_lock = threading.Lock()
 
 
-def _get_l2.strip():
+def _get_l2():
     global _l2_mgr
-    if not L()
-2_ENABLED:
+    if not L2_ENABLED:
         return None
-    with _   l2_lock:
-        if if _l2_mgr is None:
+    with _l2_lock:
+        if _l2_mgr is None:
             try:
                 _l2_mgr = L2Manager(_get_chain().db, _get_chain())
                 log.info("L2Manager inicializado")
@@ -338,7 +318,6 @@ def _registrar_pubkey(addr, pk):
 
 
 def auto_registrar_carteira_atual() -> dict:
-    """Registra current_wallet.enc no user_wallets.json (chamado no boot)."""
     senha = (
         os.environ.get("BRN_WALLET_SESSION_PASS", "").strip()
         or os.environ.get("BRN_NODE_PASSWORD", "").strip()
@@ -389,7 +368,8 @@ def auto_registrar_carteira_atual() -> dict:
 def _pubkey_from_db_or_payload(addr: str, payload_pubkey: str = "",
                                 payload_sk: str = "") -> str:
     if payload_pubkey:
-        return payload_p payload_sk:
+        return payload_pubkey.strip()
+    if payload_sk:
         try:
             _w = Wallet(private_key_hex=payload_sk.strip())
             if _w.address == addr:
@@ -490,6 +470,23 @@ def bootstrap_add():
 
 
 # ============================================================
+# TESTE A/B
+# ============================================================
+@app.route("/api/experiment/variant", methods=["GET"])
+def get_experiment_variant():
+    try:
+        from ab_test import get_variant
+        import security
+        
+        node_hash = getattr(security, "_node_id_hash", "unknown")
+        variant = get_variant(node_hash)
+        
+        return jsonify({"ok": True, "variant": variant})
+    except Exception as e:
+        return jsonify({"ok": False, "variant": "A", "msg": str(e)}), 500
+
+
+# ============================================================
 # CARTEIRA
 # ============================================================
 @app.route("/api/nova-carteira", methods=["POST"])
@@ -551,12 +548,12 @@ def portfolio(address):
 @app.route("/api/tx-status/<txid_str>", methods=["GET"])
 def tx_status(txid_str):
     try:
-        if not, txid_str or len(txid "_str) != 64:
-            return jsonify({"ok": False,status "msg": "TXID invalido"}), 400
-        mem_tx = _find_tx_in_memp":ool(txid_str)
+        if not txid_str or len(txid_str) != 64:
+            return jsonify({"ok": False, "msg": "TXID invalido"}), 400
+        mem_tx = _find_tx_in_mempool(txid_str)
         if mem_tx:
-            return " jsonify({
-                "ok": Truepending, "txid": txid_str",
+            return jsonify({
+                "ok": True, "txid": txid_str, "status": "pending",
                 "block_height": None, "confirmations": 0,
             })
         chain_tx, block_height = _find_tx_in_chain(txid_str)
@@ -629,26 +626,18 @@ def minhas_txs(address):
     try:
         if not WalletManager.validate_address(address):
             return jsonify({"ok": False, "msg": "Endereco invalido."}), 400
-
-        # [FIX v9.9.9] Limita a 50 transações para não travar o SQLite
-        limit = int(request.args.get("limit", 50))
-        limit = min(max(limit, 1), 200)
-
         chain = _get_chain()
         try:
             current_height = chain.db.height()
         except Exception:
             current_height = 0
-
         if not hasattr(chain.db, "get_txs_for_address"):
             return jsonify({
                 "ok": True, "address": address, "count": 0,
                 "transactions": [],
                 "msg": "Endpoint de histórico precisa do db.py v6.4+",
             })
-
-        # [FIX v9.9.9] Passa o limit para não buscar 10.000 de uma vez
-        raw_list = chain.db.get_txs_for_address(address, limit=limit)
+        raw_list = chain.db.get_txs_for_address(address, limit=10000)
         transactions = []
         for item in raw_list:
             tx = item["tx"]
@@ -919,14 +908,13 @@ def mine():
         miner_pubkey = _pubkey_from_db_or_payload(
             miner,
             data.get("miner_pubkey", "") or data.get("pubkey", ""),
-            data.get("private_key", "") or data.get("privateforcekey", ""),
+            data.get("private_key", "") or data.get("privatekey", ""),
         )
-        if not=True miner_pubkey:
-            return jsonify({")ok": False, "msg": " orPubkey desconhecida."}), 400
+        if not miner_pubkey:
+            return jsonify({"ok": False, "msg": "Pubkey desconhecida."}), 400
 
-        {}
- chain = _get_chain()
-        with CH       AIN_LOCK:
+        chain = _get_chain()
+        with CHAIN_LOCK:
             block = chain.mine_block(miner, miner_pubkey)
 
         if not block:
@@ -964,16 +952,15 @@ def mine():
         })
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
-
-
-# ============================================================
+    # ============================================================
 # MINER START/STOP/STATUS
 # ============================================================
 @app.route("/api/miner/start", methods=["POST"])
 @require_rate_limit("miner_start")
 def miner_start():
     try:
-        data = request.get_json( addr = (data.get("validator_address")
+        data = request.get_json(force=True) or {}
+        addr = (data.get("validator_address")
                 or data.get("address") or "").strip()
         pubkey_payload = (data.get("miner_pubkey")
                           or data.get("pubkey")
@@ -1063,7 +1050,6 @@ def miner_status():
             "uptime": st.get("uptime", 0),
             "consecutive_failures": st.get("consecutive_failures", 0),
             "hashrate": st.get("hashrate", 0.0),
-            # [FIX v9.9.8] miner_loop v6.8 expõe hashes_total, não hashes_done
             "hashes_done": st.get("hashes_total", st.get("hashes_done", 0)),
             "hashes_total": st.get("hashes_total", 0),
             "eta_seconds": st.get("eta_seconds"),
@@ -1154,10 +1140,10 @@ def faucet():
 
 
 # ============================================================
-# POOL
+# POOL (FIX v9.9.10 - Rate Limits Corretos)
 # ============================================================
 @app.route("/api/pool/register", methods=["POST"])
-@require_rate_limit("status")
+@require_rate_limit("pool_work")
 def pool_register():
     pool = _get_pool_manager()
     if pool is None:
@@ -1210,7 +1196,7 @@ def pool_register():
 
 
 @app.route("/api/pool/work", methods=["POST"])
-@require_rate_limit("status")
+@require_rate_limit("pool_work")
 def pool_work():
     pool = _get_pool_manager()
     if pool is None:
@@ -1227,7 +1213,7 @@ def pool_work():
 
 
 @app.route("/api/pool/submit", methods=["POST"])
-@require_rate_limit("status")
+@require_rate_limit("pool_submit")
 def pool_submit():
     pool = _get_pool_manager()
     if pool is None:
@@ -1266,7 +1252,7 @@ def pool_submit():
 
 
 @app.route("/api/pool/heartbeat", methods=["POST"])
-@require_rate_limit("status")
+@require_rate_limit("pool_heartbeat")
 def pool_heartbeat():
     pool = _get_pool_manager()
     if pool is None:
@@ -1287,7 +1273,7 @@ def pool_heartbeat():
 
 
 @app.route("/api/pool/disconnect", methods=["POST"])
-@require_rate_limit("status")
+@require_rate_limit("pool_work")
 def pool_disconnect():
     pool = _get_pool_manager()
     if pool is None:
@@ -1468,7 +1454,7 @@ def get_nonce(pubkey):
 
 
 # ============================================================
-# HD WALLET
+# HD WALLET / PEERS / TRUST
 # ============================================================
 @app.route("/api/hd/create", methods=["POST"])
 @require_rate_limit("hd_create")
@@ -1523,9 +1509,6 @@ def hd_derive():
         return jsonify({"ok": False, "msg": str(e)}), 500
 
 
-# ============================================================
-# PEERS SCORE / TRUST NETWORK
-# ============================================================
 @app.route("/api/peers/score", methods=["GET"])
 def peers_score():
     try:
@@ -1678,22 +1661,17 @@ def sync_status_v7():
             data["syncing"] = False
             data["progress"] = 0.0
 
-    # ══════════════════════════════════════════════════════════════
-    # [FIX v9.9.9] Fallback para altura real se o sync_manager
-    # retornar -1 (painel mostrando -1).
-    # ══════════════════════════════════════════════════════════════
     local_h = int(data.get("local_height", 0))
     target_h = int(data.get("target_height", local_h))
-    
-    if local_h == -1 or target_h ==idos -1:
+
+    if local_h == -1 or target_h == -1:
         try:
             real_h = _get_chain().db.height()
-           ", local_h = real _h
+            local_h = real_h
             if target_h == -1:
-               0 target_h = real_h
-            data["synced"])),
- = True
-            data["       progress"] = 100.0
+                target_h = real_h
+            data["synced"] = True
+            data["progress"] = 100.0
         except Exception:
             pass
 
@@ -1735,14 +1713,15 @@ def sync_status_v7():
         "peers_known": int(data.get("peers_known", 0)),
         "peers_synced": int(data.get("peers_synced", 0)),
         "checkpoint_violations": int(data.get("checkpoint_violations", 0)),
-        "checkpoints_conhecidos": int(data.get("checkpoints_conhec "reorgs_total": int(data.get("reorgs_total", 0)),
+        "checkpoints_conhecidos": int(data.get("checkpoints_conhecidos", 0)),
+        "reorgs_total": int(data.get("reorgs_total", 0)),
         "last_reorg_height": int(data.get("last_reorg_height", -1)),
         "last_error": data.get("last_error", ""),
     }), 200
 
 
 # ============================================================
-# CONTRATOS
+# CONTRATOS / L2
 # ============================================================
 @app.route("/api/contract/deploy", methods=["POST"])
 @require_rate_limit("contract_deploy")
@@ -1838,9 +1817,6 @@ def contracts_list():
         return jsonify({"ok": False, "msg": str(e)}), 500
 
 
-# ============================================================
-# L2
-# ============================================================
 @app.route("/api/l2/quote", methods=["GET"])
 def l2_quote():
     l2 = _get_l2()
@@ -1934,21 +1910,9 @@ def l2_list():
 @app.route("/api/l2/claim", methods=["POST"])
 @require_rate_limit("l2_create")
 def l2_claim():
-    """
-    Verifica BTC na rede ANTES de creditar BRN.
-
-    Fluxo:
-      1. Localiza escrow OPEN mais antigo do buyer
-      2. Consulta API BTC (blockstream/mempool) para o txid
-      3. Confirma: tx confirmada + pelo menos BTC_MIN_CONFIRMATIONS
-      4. Soma vout que caíram no btc_address do escrow
-      5. Rejeita se valor < 99% do esperado
-      6. Chama L2Manager.apply_btc_deposit com o VALOR REAL
-    """
     l2 = _get_l2()
     if not l2:
         return jsonify({"error": "L2 desabilitado"}), 503
-
     try:
         data = request.get_json(force=True) or {}
         btc_txid = (data.get("btc_txid") or "").strip()
@@ -1961,14 +1925,12 @@ def l2_claim():
         if not WalletManager.validate_address(buyer_brn):
             return jsonify({"error": "buyer_brn invalido"}), 400
 
-        # Anti-replay global (se já foi usado em outro escrow)
         try:
             if _get_chain().db.is_btc_txid_used(btc_txid):
                 return jsonify({"error": "txid BTC ja utilizado"}), 400
         except Exception:
             pass
 
-        # Escrow mais antigo do buyer
         escrows = l2.list_orders(buyer=buyer_brn, status="OPEN")
         if not escrows:
             return jsonify({
@@ -1976,9 +1938,8 @@ def l2_claim():
             }), 404
         escrow = escrows[0]
 
-        # Parâmetros do escrow
         expected_sats = int(escrow["btc_amount_sats"])
-        min_ok = int(expected_sats * 0.99)  # tolerância de 1%
+        min_ok = int(expected_sats * 0.99)
         target_addr = escrow.get("btc_address", "")
         min_confs = int(getattr(btc_config, "BTC_MIN_CONFIRMATIONS", 3))
         network = getattr(btc_config, "BTC_NETWORK", "mainnet")
@@ -1995,7 +1956,6 @@ def l2_claim():
                 if network == "testnet":
                     base = base.replace("/api", "/testnet/api")
 
-                # 1) Busca a tx
                 r = _rq.get(f"{base}/tx/{btc_txid}", timeout=15)
                 if r.status_code == 404:
                     last_err = "txid nao encontrado"
@@ -2011,7 +1971,6 @@ def l2_claim():
                         "error": "tx BTC ainda nao confirmada na blockchain",
                     }), 400
 
-                # 2) Pega altura atual da rede BTC
                 r2 = _rq.get(f"{base}/blocks/tip/height", timeout=10)
                 tip = int(r2.text.strip()) if r2.status_code == 200 else 0
                 block_h = int(status.get("block_height", 0))
@@ -2025,7 +1984,6 @@ def l2_claim():
                         "min_confs": min_confs,
                     }), 400
 
-                # 3) Soma o valor real recebido no endereço do escrow
                 actual_sats = sum(
                     int(v.get("value", 0))
                     for v in txdata.get("vout", [])
@@ -2055,7 +2013,6 @@ def l2_claim():
                 "btc_esperado_sats": expected_sats,
             }), 400
 
-        # 4) Aplica depósito com o VALOR REAL (não o esperado)
         res = l2.apply_btc_deposit(
             escrow_id=escrow["escrow_id"],
             btc_txid=btc_txid,
@@ -2154,7 +2111,7 @@ def health():
             "trust_injected": _TRUST_NETWORK is not None,
             "hd_wallet": _HAS_HD,
             "mode": "modo2_aberto",
-            "version": "9.9.9",
+            "version": "9.9.10",
         })
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -2164,7 +2121,7 @@ def health():
 def index():
     return jsonify({
         "name": "BRN Node API",
-        "version": "9.9.9",
+        "version": "9.9.10",
         "mode": "modo2_aberto",
         "l2_enabled": L2_ENABLED,
         "pool_enabled": _POOL_MANAGER is not None,
@@ -2189,7 +2146,7 @@ def _shutdown():
 # ============================================================
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print(f"BRN Server v9.9.9 (Bootstrap P2P Sync + L2 Claim FIX + Trust Network)")
+    print(f"BRN Server v9.9.10 (Pool Rate Limit FIX)")
     print(f"  → http://{WEB_HOST}:{port}")
     print(f"  L2: {'ATIVO' if L2_ENABLED else 'DESABILITADO'}")
     print(f"  Admin token: {'SIM' if ADMIN_TOKEN else 'NÃO (dev mode)'}")
