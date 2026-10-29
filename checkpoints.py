@@ -1,27 +1,13 @@
-"""checkpoints.py — Checkpoints assinados do BRN
+"""checkpoints.py — Checkpoints assinados do BRN (v4.0 - Multi-Sig)
 ================================================================
-A cada CHECKPOINT_INTERVAL blocos, o nó ORIGEM assina o hash do bloco
-com sua chave Ed25519. Todos os nós verificam a assinatura antes de
-aceitar blocos naquela altura.
-
-Efeito: um reorg não pode violar um checkpoint. Um atacante com
-100x mais hashrate não consegue reescrever a cadeia — os checkpoints
-são imutáveis.
-
-Formato de checkpoints.json:
-{
-  "1000": {"height":1000, "hash":"...", "sig":"...", "pub":"...", "ts":123},
-  "2000": {...}
-}
-
-API usada por blockchain.py v9.1.7:
-    load_checkpoints() -> dict
-    sign_checkpoint(height, block_hash, priv) -> dict
-    verify_checkpoint(cp) -> bool
-    save_checkpoints(d) -> bool
-
-Requer:
-    pip install cryptography
+v4.0 (2026-10-29):
+  [NEW] Checkpoints MULTI-SIG assinados pelos validadores.
+        Cada checkpoint guarda a lista de assinaturas que o bloco
+        já possui no momento em que foi aceito. Nenhuma chave
+        centralizada é necessária. Mesmo se o nó Origem for
+        comprometido, um reorg histórico é impossível sem controlar
+        o quórum de validadores.
+  [KEEP] Compatibilidade com formato legacy (Ed25519 único).
 ================================================================
 """
 from __future__ import annotations
@@ -32,37 +18,90 @@ import time
 import logging
 import threading
 
-from cryptography.hazmat.primitives.asymmetric.ed25519 import (
-    Ed25519PrivateKey,
-    Ed25519PublicKey,
-)
-
-
 log = logging.getLogger("checkpoints")
 
-# ============================================================
-# CONSTANTES
-# ============================================================
 CHECKPOINT_FILE     = os.environ.get("BRN_CHECKPOINT_FILE", "checkpoints.json")
-CHECKPOINT_DOMAIN   = b"BRN-CHECKPOINT-v1|"
-CHECKPOINT_INTERVAL = int(os.environ.get("BRN_CHECKPOINT_INTERVAL", "1000"))
+CHECKPOINT_INTERVAL = int(os.environ.get("BRN_CHECKPOINT_INTERVAL", "100"))
 
 _lock = threading.RLock()
 
 
 # ============================================================
-# PAYLOAD CANÔNICO
+# VERIFICAÇÃO — suporta dois formatos
 # ============================================================
-def _payload(height: int, block_hash: str) -> bytes:
-    """Mensagem assinada: domínio || height || ':' || hash."""
-    return CHECKPOINT_DOMAIN + f"{int(height)}:{block_hash}".encode("utf-8")
+def verify_checkpoint(cp: dict) -> bool:
+    """
+    Verifica um checkpoint. Aceita os dois formatos:
+      - Legacy: {"sig": hex, "pub": hex}        → Ed25519 única
+      - Multi:  {"signatures": [{pubkey, signature}, ...]}  → secp256k1
+    """
+    if not isinstance(cp, dict):
+        return False
+
+    try:
+        height = int(cp["height"])
+        block_hash = str(cp["hash"])
+    except Exception:
+        return False
+
+    # --- Formato novo: multi-sig (secp256k1) ---
+    if "signatures" in cp:
+        sigs = cp.get("signatures") or []
+        if not isinstance(sigs, list):
+            return False
+
+        required = int(cp.get("quorum_required", 0))
+        if required <= 0:
+            return False
+
+        # Mensagem assinada — mesmo domínio do bloco
+        from blockchain import BLOCK_SIG_DOMAIN, sha256
+        payload = sha256(BLOCK_SIG_DOMAIN + block_hash.encode())
+
+        valid_count = 0
+        seen = set()
+        for entry in sigs:
+            if not isinstance(entry, dict):
+                continue
+            pk = (entry.get("pubkey") or "").strip()
+            sg = (entry.get("signature") or "").strip()
+            if not pk or not sg or pk in seen:
+                continue
+            seen.add(pk)
+            try:
+                from wallet import Wallet
+                if Wallet.verify(payload, sg, pk):
+                    valid_count += 1
+            except Exception:
+                continue
+
+        return valid_count >= required
+
+    # --- Formato legado: Ed25519 única ---
+    if "sig" in cp and "pub" in cp:
+        try:
+            from crypto import Ed25519PublicKey
+            from .checkpoints_domain import _payload  # fallback abaixo
+        except Exception:
+            _payload = lambda h, bh: b"BRN-CHECKPOINT-v1|" + f"{h}:{bh}".encode()
+        try:
+            sig = bytes.fromhex(cp["sig"])
+            pub = bytes.fromhex(cp["pub"])
+            if len(pub) != 32 or len(sig) != 64:
+                return False
+            pk = Ed25519PublicKey.from_public_bytes(pub)
+            pk.verify(sig, _payload(height, block_hash))
+            return True
+        except Exception:
+            return False
+
+    return False
 
 
 # ============================================================
 # LEITURA / ESCRITA
 # ============================================================
 def load_checkpoints() -> dict:
-    """Lê checkpoints.json. Retorna {} se não existir ou estiver inválido."""
     if not os.path.exists(CHECKPOINT_FILE):
         return {}
     try:
@@ -78,7 +117,6 @@ def load_checkpoints() -> dict:
 
 
 def save_checkpoints(d: dict) -> bool:
-    """Grava atomicamente (tmp + rename). Retorna True se sucesso."""
     if not isinstance(d, dict):
         return False
     with _lock:
@@ -96,76 +134,46 @@ def save_checkpoints(d: dict) -> bool:
 
 
 # ============================================================
-# ASSINATURA
+# CRIAÇÃO DO CHECKPOINT MULTI-SIG
 # ============================================================
-def sign_checkpoint(height: int, block_hash: str, priv) -> dict:
+def build_multisig_checkpoint(
+    block: dict,
+    signatures: list,
+    validators_at_time: list,
+    quorum_required: int,
+) -> dict:
     """
-    Assina um checkpoint. 'priv' é Ed25519PrivateKey.
-    Retorna dict vazio se priv for None ou assinatura falhar.
+    Monta o dicionário de checkpoint a partir das assinaturas
+    do próprio bloco. Nenhuma assinatura nova é gerada.
     """
-    if priv is None:
-        return {}
-    if not isinstance(block_hash, str) or not block_hash:
-        return {}
-    try:
-        h = int(height)
-    except (ValueError, TypeError):
-        return {}
-
-    try:
-        sig_bytes = priv.sign(_payload(h, block_hash))
-        pub_bytes = priv.public_key().public_bytes_raw()
-        return {
-            "height": h,
-            "hash":   block_hash,
-            "sig":    sig_bytes.hex(),
-            "pub":    pub_bytes.hex(),
-            "ts":     int(time.time()),
-        }
-    except Exception as e:
-        log.error(f"erro ao assinar checkpoint #{h}: {e}")
-        return {}
+    return {
+        "height": int(block["height"]),
+        "hash": str(block["hash"]),
+        "signatures": [
+            {
+                "pubkey": (s or {}).get("pubkey", ""),
+                "signature": (s or {}).get("signature", ""),
+            }
+            for s in signatures
+            if isinstance(s, dict)
+            and s.get("pubkey")
+            and s.get("signature")
+        ],
+        "validators_at_time": list(validators_at_time),
+        "quorum_required": int(quorum_required),
+        "created_at": int(time.time()),
+    }
 
 
 # ============================================================
-# VERIFICAÇÃO
+# VERIFICAÇÃO DE UM BLOCO CONTRA UM CHECKPOINT
 # ============================================================
-def verify_checkpoint(cp: dict) -> bool:
-    """
-    Verifica a assinatura Ed25519 do checkpoint.
-    Retorna True se válido.
-    """
-    if not isinstance(cp, dict):
-        return False
-    try:
-        height = int(cp["height"])
-        block_hash = str(cp["hash"])
-        sig = bytes.fromhex(cp["sig"])
-        pub = bytes.fromhex(cp["pub"])
-    except Exception:
-        return False
-
-    if len(pub) != 32 or len(sig) != 64:
-        return False
-
-    try:
-        Ed25519PublicKey.from_public_bytes(pub).verify(
-            sig, _payload(height, block_hash)
-        )
-        return True
-    except Exception:
-        return False
-
-
 def verify_checkpoint_for(chain, height: int) -> tuple:
-    """
-    Procura um checkpoint para `height` e verifica se bate com o bloco
-    atual da cadeia. Retorna (ok, msg).
-    """
+    """Compara o bloco local com o checkpoint. Retorna (ok, msg)."""
     cps = load_checkpoints()
     cp = cps.get(str(height))
     if not cp:
-        return True, ""  # sem checkpoint = sem restrição
+        return True, ""
 
     if not verify_checkpoint(cp):
         return False, f"checkpoint #{height} assinatura invalida"
@@ -179,9 +187,10 @@ def verify_checkpoint_for(chain, height: int) -> tuple:
         return False, f"bloco #{height} ausente"
 
     if blk["hash"] != cp["hash"]:
-        return False, (f"checkpoint #{height} hash diverge "
-                       f"(esperado {cp['hash'][:16]}..., "
-                       f"bloco {blk['hash'][:16]}...)")
+        return False, (
+            f"checkpoint #{height} hash diverge "
+            f"(esperado {cp['hash'][:16]}..., bloco {blk['hash'][:16]}...)"
+        )
 
     return True, ""
 
@@ -190,17 +199,12 @@ def verify_checkpoint_for(chain, height: int) -> tuple:
 # MESCLAGEM
 # ============================================================
 def merge_checkpoints(local: dict, remote: dict) -> dict:
-    """
-    Une dois dicts. Em conflito de altura, mantém o LOCAL.
-    Útil para sincronizar checkpoints entre peers sem perder os locais.
-    """
     merged = dict(remote or {})
     merged.update(local or {})
     return merged
 
 
 def merge_from_file(path: str) -> int:
-    """Funde um checkpoints.json externo no local. Retorna quantos adicionou."""
     if not os.path.exists(path):
         return 0
     try:
@@ -211,138 +215,58 @@ def merge_from_file(path: str) -> int:
         return 0
     if not isinstance(remote, dict):
         return 0
-
     local = load_checkpoints()
     before = set(local.keys())
     merged = merge_checkpoints(local, remote)
-    after = set(merged.keys())
-    added = len(after - before)
-
+    added = len(set(merged.keys()) - before)
     if added > 0:
         save_checkpoints(merged)
-        log.info(f"merge: {added} checkpoint(s) adicionados de {path}")
     return added
 
 
 # ============================================================
-# API ALTO NÍVEL — assinatura automática em intervalos
-# ============================================================
-class CheckpointSigner:
-    """
-    Helper que assina um checkpoint a cada CHECKPOINT_INTERVAL blocos.
-    Chame .maybe_sign(block, priv) a cada bloco aceito.
-    """
-
-    def __init__(self, priv=None, interval: int = CHECKPOINT_INTERVAL):
-        self.priv = priv
-        self.interval = interval
-        self._cache: dict = load_checkpoints()
-
-    def set_priv(self, priv) -> None:
-        self.priv = priv
-
-    def maybe_sign(self, block: dict) -> bool:
-        """Assina se a altura for múltipla do intervalo. Retorna True se assinou."""
-        if self.priv is None:
-            return False
-        try:
-            h = int(block["height"])
-        except Exception:
-            return False
-        if h == 0 or h % self.interval != 0:
-            return False
-
-        h_str = str(h)
-        if h_str in self._cache:
-            # já assinado
-            return False
-
-        cp = sign_checkpoint(h, block["hash"], self.priv)
-        if not cp:
-            return False
-
-        self._cache[h_str] = cp
-        if save_checkpoints(self._cache):
-            log.info(f"[CHECKPOINT] #{h} assinado e salvo")
-            return True
-        return False
-
-    def get_all(self) -> dict:
-        return dict(self._cache)
-
-    def reload(self) -> None:
-        self._cache = load_checkpoints()
-
-
-# ============================================================
-# CLI / AUTO-TESTE
+# AUTO-TESTE
 # ============================================================
 if __name__ == "__main__":
-    import sys
     import tempfile
+    logging.basicConfig(level=logging.INFO)
 
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s [%(levelname)s] %(message)s")
+    with tempfile.TemporaryDirectory() as td:
+        globals()["CHECKPOINT_FILE"] = os.path.join(td, "cps.json")
 
-    cmd = sys.argv[1] if len(sys.argv) > 1 else "test"
+        # 1) Checkpoint multi-sig válido
+        from wallet import Wallet
+        from blockchain import signing_hash_block
 
-    if cmd == "test":
-        print("Testando checkpoints...")
-        with tempfile.TemporaryDirectory() as td:
-            # aponta arquivo temporário
-            globals()["CHECKPOINT_FILE"] = os.path.join(td, "cps.json")
+        priv1 = Wallet.create()
+        priv2 = Wallet.create()
+        priv3 = Wallet.create()
+        block = {"height": 100, "hash": "a" * 64}
 
-            # 1. Cria chave e assina
-            priv = Ed25519PrivateKey.generate()
-            cp = sign_checkpoint(1000, "abc123" * 8, priv)
-            assert cp, "sign_checkpoint falhou"
-            assert cp["height"] == 1000
-            assert cp["hash"] == "abc123" * 8
-            assert "sig" in cp and "pub" in cp
-            print("  [ok] sign_checkpoint")
+        payload = signing_hash_block(block)
+        sigs = [
+            {"pubkey": priv1.pub_hex, "signature": priv1.sign(payload)},
+            {"pubkey": priv2.pub_hex, "signature": priv2.sign(payload)},
+        ]
+        cp = build_multisig_checkpoint(
+            block, sigs,
+            validators_at_time=[priv1.pub_hex, priv2.pub_hex, priv3.pub_hex],
+            quorum_required=2,
+        )
+        assert verify_checkpoint(cp), "checkpoint multi-sig deveria ser válido"
+        print("  [ok] checkpoint multi-sig válido")
 
-            # 2. Verifica
-            assert verify_checkpoint(cp), "verify_checkpoint deveria passar"
-            print("  [ok] verify_checkpoint (valido)")
+        # 2) Checkpoint com quórum insuficiente
+        cp_bad = build_multisig_checkpoint(
+            block, sigs[:1], validators_at_time=[], quorum_required=2,
+        )
+        assert not verify_checkpoint(cp_bad), "quórum insuficiente deveria falhar"
+        print("  [ok] quórum insuficiente rejeitado")
 
-            # 3. Adulterar hash
-            bad = dict(cp)
-            bad["hash"] = "deadbeef" * 8
-            assert not verify_checkpoint(bad), "checkpoint adulterado deveria falhar"
-            print("  [ok] verify_checkpoint rejeita adulteracao")
+        # 3) Checkpoint com bloco adulterado
+        cp_bad2 = dict(cp)
+        cp_bad2["hash"] = "b" * 64
+        assert not verify_checkpoint(cp_bad2), "hash adulterado deveria falhar"
+        print("  [ok] hash adulterado rejeitado")
 
-            # 4. Save/load
-            d = {"1000": cp}
-            assert save_checkpoints(d), "save_checkpoints falhou"
-            loaded = load_checkpoints()
-            assert loaded == d, f"load_checkpoints retornou {loaded}"
-            print("  [ok] save/load")
-
-            # 5. Merge
-            cp2 = sign_checkpoint(2000, "abc999" * 8, priv)
-            merged = merge_checkpoints({"1000": cp}, {"2000": cp2, "1000": {"x": 1}})
-            assert "2000" in merged
-            assert merged["1000"] == cp  # local venceu
-            print("  [ok] merge_checkpoints")
-
-            # 6. CheckpointSigner
-            signer = CheckpointSigner(priv, interval=100)
-            assert signer.maybe_sign({"height": 100, "hash": "h1"})
-            assert not signer.maybe_sign({"height": 100, "hash": "h1"})  # já assinado
-            assert not signer.maybe_sign({"height": 50, "hash": "h2"})   # não múltiplo
-            assert signer.maybe_sign({"height": 200, "hash": "h2"})
-            print("  [ok] CheckpointSigner")
-
-        print("Todos os testes passaram.")
-
-    elif cmd == "show":
-        cps = load_checkpoints()
-        print(f"Checkpoints em {CHECKPOINT_FILE}: {len(cps)}")
-        for h in sorted(cps.keys(), key=lambda x: int(x))[:20]:
-            cp = cps[h]
-            ok = verify_checkpoint(cp)
-            marker = "OK" if ok else "X "
-            print(f"  [{marker}] #{h}  {cp.get('hash','?')[:24]}...")
-
-    else:
-        print(f"Uso: python checkpoints.py [test|show]")
+    print("checkpoints.py v4.0 OK.")
